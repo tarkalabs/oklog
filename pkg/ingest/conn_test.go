@@ -1,17 +1,25 @@
 package ingest
 
 import (
-	"bufio"
+	"bytes"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"math"
+	mathrand "math/rand"
 	"net"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/oklog/ulid"
+
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/oklog/oklog/pkg/fs"
+	"github.com/oklog/oklog/pkg/record"
 )
 
 func TestHandleConnectionsCleanup(t *testing.T) {
@@ -45,7 +53,7 @@ func TestHandleConnectionsCleanup(t *testing.T) {
 	)
 	go func() {
 		errc <- HandleConnections(
-			ln, connectionHandler, log, segmentFlushAge, segmentFlushSize,
+			ln, connectionHandler, record.NewDynamicReader, log, segmentFlushAge, segmentFlushSize,
 			connectedClients, bytes, records, syncs, segmentAge, segmentSize,
 		)
 	}()
@@ -61,7 +69,7 @@ func TestHandleConnectionsCleanup(t *testing.T) {
 	}
 
 	// Write something to make sure the connection is good.
-	message := "hello, world!\n"
+	message := "test_topic hello, world!\n"
 	if n, err := fmt.Fprint(conn, message); err != nil {
 		t.Fatal(err)
 	} else if want, have := len(message), n; want != have {
@@ -102,13 +110,17 @@ func TestHandleConnectionsCleanup(t *testing.T) {
 }
 
 func echo(t *testing.T) ConnectionHandler {
-	return func(conn net.Conn, w *Writer, _ IDGenerator, _ prometheus.Gauge) error {
-		s := bufio.NewScanner(conn)
-		for s.Scan() {
-			t.Logf("RECV> %s", s.Text())
-			fmt.Fprintln(w, s.Text())
+	return func(read record.Reader, w *Writer, _ IDGenerator, _ prometheus.Gauge) error {
+		for {
+			r, err := read()
+			if err == io.EOF {
+				return nil
+			} else if err != nil {
+				return err
+			}
+			t.Logf("RECV> %s", r)
+			fmt.Fprintln(w, r)
 		}
-		return s.Err()
 	}
 }
 
@@ -147,3 +159,65 @@ func (f *mockFile) Sync() error                 { return nil }
 type mockReleaser struct{}
 
 func (mockReleaser) Release() error { return nil }
+
+func TestStreamClock(t *testing.T) {
+	sc := newStreamClock()
+
+	if _, err := sc.Read(make([]byte, 5)); err == nil {
+		t.Fatalf("expected error on read with length other than 10")
+	}
+
+	b := make([]byte, 10)
+	lastRand := make([]byte, 6)
+
+	// Ensure clock is incremented properly.
+	for i := uint32(0); i <= 100; i++ {
+		copy(lastRand, b[:6])
+
+		if n, err := sc.Read(b); err != nil {
+			t.Fatalf("read failed: %s", err)
+		} else if n != 10 {
+			t.Fatalf("unexpected read length %d, want 10", n)
+		}
+		x := binary.BigEndian.Uint32(b[6:])
+		if x != i {
+			t.Fatalf("unexpected clock value %d, want %d", x, i)
+		}
+		// The first random 6 bytes should not change.
+		if i > 0 && !bytes.Equal(b[:6], lastRand) {
+			t.Fatalf("unexpected change in random component: got %x, want %x", b[:6], lastRand)
+		}
+	}
+
+	// Manually update the clock component to right before overflowing.
+	// The random component should be incremented on the next read and 4 high bytes
+	// should be reset to 0.
+	sc.clock |= math.MaxUint32
+	prev := sc.clock
+
+	if n, err := sc.Read(b); err != nil {
+		t.Fatalf("read failed: %s", err)
+	} else if n != 10 {
+		t.Fatalf("unexpected read length %d, want 10", n)
+	}
+	if sc.clock != prev+1 {
+		t.Fatalf("expected clock counter %d after increment, got %d", prev+1, sc.clock)
+	} else if uint32(sc.clock) != 0 {
+		t.Fatalf("unexpected non-zero value %d of 4 highest bytes", uint32(sc.clock))
+	}
+}
+
+func BenchmarkStreamClockULID(b *testing.B) {
+	for n, r := range map[string]io.Reader{
+		"empty":       nil,
+		"math-rand":   mathrand.New(mathrand.NewSource(0)),
+		"crypto-rand": cryptorand.Reader,
+		"streamclock": newStreamClock(),
+	} {
+		b.Run(fmt.Sprintf("entropy/%s", n), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				ulid.MustNew(uint64(i), r)
+			}
+		})
+	}
+}

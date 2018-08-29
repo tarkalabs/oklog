@@ -13,7 +13,7 @@ import Html
         , label
         , nav
         , option
-        , program
+        , programWithFlags
         , section
         , select
         , span
@@ -24,18 +24,38 @@ import Html
         , text
         , tr
         )
-import Html.Attributes exposing (autofocus, class, disabled, for, id, placeholder, type_, value)
+import Html.Attributes
+    exposing
+        ( autofocus
+        , class
+        , disabled
+        , for
+        , id
+        , placeholder
+        , type_
+        , value
+        )
 import Html.Events exposing (on, onClick, onInput, onSubmit, targetValue)
-import Http exposing (Request, Response, emptyBody, expectStringResponse, request, send)
+import Http
+    exposing
+        ( Request
+        , Response
+        , emptyBody
+        , expectStringResponse
+        , request
+        , send
+        )
 import Json.Decode as Json
+import Navigation
+import RFC3339
 import Task
 import Time exposing (Time, every, hour, millisecond, minute)
-import RFC3339
+import UrlParser exposing ((<?>), parsePath, stringParam, top)
 
 
-main : Program Never Model Msg
+main : Program Flags Model Msg
 main =
-    program
+    Navigation.programWithFlags (\loc -> Nop)
         { init = init
         , subscriptions = subscriptions
         , update = update
@@ -47,8 +67,15 @@ main =
 -- MODEL
 
 
-type alias Model =
+type alias Flags =
     { now : Time
+    }
+
+
+type alias Model =
+    { error : Maybe String
+    , now : Time
+    , params : Maybe Params
     , query : Query
     , records : List Record
     , stats : Maybe Stats
@@ -78,9 +105,19 @@ type alias Stats =
     }
 
 
-init : ( Model, Cmd Msg )
-init =
-    ( Model 0 initQuery [] Nothing False, Task.perform Now Time.now )
+type alias Params =
+    { path : String
+    , debug : Bool
+    }
+
+
+init : Flags -> Navigation.Location -> ( Model, Cmd Msg )
+init { now } location =
+    let
+        params =
+            parsePath (UrlParser.map Params paramsParser) location
+    in
+        ( Model Nothing now params initQuery [] Nothing False, Cmd.none )
 
 
 initQuery : Query
@@ -93,12 +130,32 @@ initStats =
     Stats 0 0 0 0
 
 
+paramsParser : UrlParser.Parser (String -> Bool -> Params) Params
+paramsParser =
+    UrlParser.string <?> boolParam "debug"
+
+
+boolParam : String -> UrlParser.QueryParser (Bool -> a) a
+boolParam name =
+    UrlParser.customParam name boolParamExtract
+
+
+boolParamExtract : Maybe String -> Bool
+boolParamExtract maybeValue =
+    case maybeValue of
+        Nothing ->
+            False
+
+        Just _ ->
+            True
+
+
 
 -- UPDATE
 
 
 type Msg
-    = Now Time
+    = Nop
     | Plan Time
     | QueryFormSubmit
     | QueryRegexUpdate String
@@ -115,8 +172,8 @@ type Msg
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        Now now ->
-            ( { model | now = now }, Cmd.none )
+        Nop ->
+            ( model, Cmd.none )
 
         Plan now ->
             let
@@ -170,8 +227,8 @@ update msg model =
         StatsUpdate (Ok stats) ->
             ( { model | stats = Just stats }, Cmd.none )
 
-        StatsUpdate (Err _) ->
-            ( model, Cmd.none )
+        StatsUpdate (Err err) ->
+            ( { model | error = Just ("StatsUpdateError: " ++ (httpError err)) }, Cmd.none )
 
         StreamCancel ->
             ( { model | streamRunning = False }, streamCancel "" )
@@ -179,8 +236,8 @@ update msg model =
         StreamComplete _ ->
             ( { model | streamRunning = False }, scroll "" )
 
-        StreamError _ ->
-            ( { model | streamRunning = False }, Cmd.none )
+        StreamError err ->
+            ( { model | error = Just ("StreamError: " ++ err), streamRunning = False }, Cmd.none )
 
         StreamLines lines ->
             let
@@ -190,7 +247,7 @@ update msg model =
                 records =
                     List.map parseRecord lines
             in
-                ( { model | records = (model.records ++ records) }
+                ( { model | records = model.records ++ records }
                 , Cmd.batch
                     [ streamContinue ""
                     , scroll ""
@@ -244,7 +301,7 @@ queryUrl : Time -> Query -> String
 queryUrl now query =
     let
         from =
-            Http.encodeUri (RFC3339.encode (fromTime (now - (windowDuration query.window))))
+            Http.encodeUri (RFC3339.encode (fromTime (now - windowDuration query.window)))
 
         to =
             Http.encodeUri (RFC3339.encode (fromTime now))
@@ -352,7 +409,8 @@ view model =
             ]
         , footer []
             [ div [ class "container" ]
-                [ viewDebug model
+                [ viewError model
+                , viewDebug model
                 ]
             ]
         ]
@@ -362,12 +420,30 @@ viewDebug : Model -> Html Msg
 viewDebug model =
     let
         slimModel =
-            { now = model.now
+            { error = model.error
+            , now = model.now
+            , params = model.params
             , query = model.query
             , stats = model.stats
+            , streamRunning = model.streamRunning
             }
     in
-        div [ class "debug" ] [ text (toString slimModel) ]
+        case showDebug model of
+            True ->
+                div [ class "debug" ] [ text (toString slimModel) ]
+
+            False ->
+                div [] []
+
+
+viewError : Model -> Html Msg
+viewError { error } =
+    case error of
+        Nothing ->
+            div [] []
+
+        Just err ->
+            div [ class "error" ] [ text err ]
 
 
 viewMatchList : String -> String -> List Int -> List (Html Msg) -> List (Html Msg)
@@ -377,7 +453,7 @@ viewMatchList query line indexes elements =
             if String.length line == 0 then
                 elements
             else
-                elements ++ ([ span [] [ text line ] ])
+                elements ++ [ span [] [ text line ] ]
 
         Just index ->
             let
@@ -407,7 +483,7 @@ viewPlan stats =
                             "1 node"
 
                         _ ->
-                            (toString stats.nodesQueried) ++ " nodes"
+                            toString stats.nodesQueried ++ " nodes"
 
                 segmentsText =
                     case stats.segmentsQueried of
@@ -415,7 +491,7 @@ viewPlan stats =
                             "1 segment"
 
                         _ ->
-                            (toString stats.segmentsQueried) ++ " segments"
+                            toString stats.segmentsQueried ++ " segments"
 
                 elements =
                     [ span [] [ text "Your query could return " ]
@@ -459,7 +535,7 @@ viewResultInfo numRecords =
             else
                 span []
                     [ text "Displaying "
-                    , strong [] [ text ((toString numRecords) ++ " records") ]
+                    , strong [] [ text (toString numRecords ++ " records") ]
                     ]
     in
         div [ class "result-info" ] [ recordCount ]
@@ -608,6 +684,25 @@ windowDuration window =
 -- HELPER
 
 
+httpError : Http.Error -> String
+httpError err =
+    case err of
+        Http.Timeout ->
+            "timeout"
+
+        Http.NetworkError ->
+            "network error"
+
+        Http.BadUrl reason ->
+            reason
+
+        Http.BadStatus res ->
+            toString res.status.code
+
+        Http.BadPayload reason _ ->
+            reason
+
+
 prettyPrintDataSet : Int -> String
 prettyPrintDataSet size =
     if size > 1000000000 then
@@ -617,4 +712,14 @@ prettyPrintDataSet size =
     else if size > 1000 then
         toString (size // 1000) ++ "kB"
     else
-        (toString size) ++ "Bytes"
+        toString size ++ "Bytes"
+
+
+showDebug : Model -> Bool
+showDebug model =
+    case model.params of
+        Nothing ->
+            False
+
+        Just params ->
+            params.debug

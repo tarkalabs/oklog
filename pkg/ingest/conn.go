@@ -1,10 +1,10 @@
 package ingest
 
 import (
-	"bufio"
-	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"sync"
@@ -12,6 +12,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/oklog/oklog/pkg/record"
 	"github.com/oklog/ulid"
 )
 
@@ -20,6 +21,7 @@ import (
 func HandleConnections(
 	ln net.Listener,
 	h ConnectionHandler,
+	rfac record.ReaderFactory,
 	log Log,
 	segmentFlushAge time.Duration,
 	segmentFlushSize int,
@@ -45,17 +47,17 @@ func HandleConnections(
 			return err
 		}
 
-		// Create a new entropy source and ID generator for this connection.
-		// rand.New is not goroutine safe!
-		entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
-		idGen := func() string { return ulid.MustNew(ulid.Now(), entropy).String() }
+		// Create a new logical clock for the stream and ID generator for this connection.
+		clock := newStreamClock()
+		idGen := func() string { return ulid.MustNew(ulid.Now(), clock).String() }
 
 		// Register the connection in the manager, and launch the handler.
 		// The handler may exit from the client, or via manager shutdown.
 		// In either case, the writer is closed.
 		m.register(conn)
 		go func() {
-			h(conn, w, idGen, connectedClients)
+			defer conn.Close()
+			h(rfac(conn), w, idGen, connectedClients)
 			w.Stop() // make sure it's flushed
 			m.remove(conn)
 		}()
@@ -63,67 +65,60 @@ func HandleConnections(
 }
 
 // ConnectionHandler forwards records from the net.Conn to the IngestLog.
-type ConnectionHandler func(conn net.Conn, w *Writer, idGen IDGenerator, connectedClients prometheus.Gauge) error
+type ConnectionHandler func(r record.Reader, w *Writer, idGen IDGenerator, connectedClients prometheus.Gauge) error
 
 // HandleFastWriter is a ConnectionHandler that writes records to the IngestLog.
-func HandleFastWriter(conn net.Conn, w *Writer, idGen IDGenerator, connectedClients prometheus.Gauge) (err error) {
+func HandleFastWriter(r record.Reader, w *Writer, idGen IDGenerator, connectedClients prometheus.Gauge) (err error) {
 	connectedClients.Inc()
 	defer connectedClients.Dec()
-	defer conn.Close()
-	s := bufio.NewScanner(conn)
-	s.Split(scanLinesPreserveNewline)
-	for s.Scan() {
+
+	for {
+		record, err := r()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		// TODO(pb): short writes are possible
-		if _, err := fmt.Fprintf(w, "%s %s", idGen(), s.Text()); err != nil {
+		if _, err := fmt.Fprintf(w, "%s %s", idGen(), record); err != nil {
 			return err
 		}
 	}
-	return s.Err()
 }
 
 // HandleDurableWriter is a ConnectionHandler that writes records to the
 // IngestLog and syncs after each record.
-func HandleDurableWriter(conn net.Conn, w *Writer, idGen IDGenerator, connectedClients prometheus.Gauge) (err error) {
+func HandleDurableWriter(r record.Reader, w *Writer, idGen IDGenerator, connectedClients prometheus.Gauge) (err error) {
 	connectedClients.Inc()
 	defer connectedClients.Dec()
-	defer conn.Close()
-	s := bufio.NewScanner(conn)
-	s.Split(scanLinesPreserveNewline)
-	for s.Scan() {
+
+	for {
+		record, err := r()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		// TODO(pb): short writes are possible
-		if _, err := fmt.Fprintf(w, "%s %s", idGen(), s.Text()); err != nil {
+		if _, err := fmt.Fprintf(w, "%s %s", idGen(), record); err != nil {
 			return err
 		}
 		if err := w.Sync(); err != nil {
 			return err
 		}
 	}
-	return s.Err()
 }
 
 // HandleBulkWriter is a ConnectionHandler that writes an entire segment to the
 // IngestLog at once.
-func HandleBulkWriter(conn net.Conn, w *Writer, idGen IDGenerator, connectedClients prometheus.Gauge) (err error) {
-	conn.Close()
+func HandleBulkWriter(r record.Reader, w *Writer, idGen IDGenerator, connectedClients prometheus.Gauge) (err error) {
 	return errors.New("TODO(pb): not implemented")
 }
 
 // IDGenerator should return unique record identifiers, i.e. ULIDs.
 type IDGenerator func() string
-
-// Like bufio.ScanLines, but retain the \n.
-func scanLinesPreserveNewline(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
-	if i := bytes.IndexByte(data, '\n'); i >= 0 {
-		return i + 1, data[0 : i+1], nil
-	}
-	if atEOF {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
-}
 
 func newConnectionManager() *connectionManager {
 	return &connectionManager{
@@ -171,4 +166,40 @@ func (m *connectionManager) isEmpty() bool {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
 	return len(m.active) <= 0
+}
+
+// streamClock is a logical clock that is initialized to start at a random offset
+// that identifies a stream.
+// It's guaranteed that the 4 high bytes are 0 initially. If they overflow, the random
+// component is incremented by 1, effectively creating a new stream identifier.
+// It is not safe to be used concurrently.
+type streamClock struct {
+	prefix [2]byte
+	clock  uint64
+}
+
+func newStreamClock() *streamClock {
+	var sc streamClock
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	binary.BigEndian.PutUint16(sc.prefix[:], uint16(r.Int()))
+	// The first 4 bytes of the clock are initialized randomly. The first bit is always
+	// zero so the random part just increments by 1 if the high 4 bytes overflow.
+	sc.clock = uint64(r.Int31()) << 32
+
+	return &sc
+}
+
+// Read populates b with the next clock tick and increments the clock.
+// b must be of length 10.
+func (sc *streamClock) Read(b []byte) (int, error) {
+	if len(b) != 10 {
+		return 0, fmt.Errorf("illegal read of length %d, expected 10", len(b))
+	}
+	copy(b, sc.prefix[:])
+	binary.BigEndian.PutUint64(b[2:], sc.clock)
+
+	sc.clock++
+
+	return len(b), nil
 }

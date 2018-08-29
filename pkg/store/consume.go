@@ -26,6 +26,7 @@ type Consumer struct {
 	client             *http.Client
 	segmentTargetSize  int64
 	segmentTargetAge   time.Duration
+	segmentDelay       time.Duration
 	replicationFactor  int
 	gatherErrors       int                 // heuristic to move out of gather state
 	pending            map[string][]string // ingester: segment IDs
@@ -46,6 +47,7 @@ func NewConsumer(
 	client *http.Client,
 	segmentTargetSize int64,
 	segmentTargetAge time.Duration,
+	segmentDelay time.Duration,
 	replicationFactor int,
 	consumedSegments, consumedBytes prometheus.Counter,
 	replicatedSegments, replicatedBytes prometheus.Counter,
@@ -56,6 +58,7 @@ func NewConsumer(
 		client:             client,
 		segmentTargetSize:  segmentTargetSize,
 		segmentTargetAge:   segmentTargetAge,
+		segmentDelay:       segmentDelay,
 		replicationFactor:  replicationFactor,
 		gatherErrors:       0,
 		pending:            map[string][]string{},
@@ -73,7 +76,7 @@ func NewConsumer(
 // Run consumes segments from ingest nodes, and replicates them to the cluster.
 // Run returns when Stop is invoked.
 func (c *Consumer) Run() {
-	step := time.NewTicker(100 * time.Millisecond)
+	step := time.NewTicker(c.segmentDelay)
 	defer step.Stop()
 	state := c.gather
 	for {
@@ -201,8 +204,11 @@ func (c *Consumer) gather() stateFn {
 	}
 
 	// Merge the segment into our active segment.
-	var cw countingWriter
-	if _, _, _, err := mergeRecords(c.active, io.TeeReader(readResp.Body, &cw)); err != nil {
+	var (
+		cw  countingWriter
+		tmp bytes.Buffer
+	)
+	if _, _, _, err := mergeRecords(&tmp, c.active, io.TeeReader(readResp.Body, &cw)); err != nil {
 		c.reporter.ReportEvent(Event{
 			Op: "gather", Error: err,
 			Msg: fmt.Sprintf("ingester %s, during %s: fatal error", instance, "mergeRecords"),
@@ -210,6 +216,7 @@ func (c *Consumer) gather() stateFn {
 		c.gatherErrors++
 		return c.fail // fail everything, same as above
 	}
+	c.active = &tmp
 	if c.activeSince.IsZero() {
 		c.activeSince = time.Now()
 	}

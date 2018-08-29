@@ -1,5 +1,5 @@
 ; (function() {
-	var app = Elm.Main.fullscreen(),
+	var app = Elm.Main.fullscreen({ "now": (new Date()).getTime() }),
 		left = "",
 		scroll = false,
 		stream = null;
@@ -69,6 +69,8 @@
 			stream = response.body.getReader();
 
 			read();
+		}).catch(function(err) {
+		    app.ports.streamError.send(err.message);
 		});
 	});
 }).call(this);

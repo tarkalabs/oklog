@@ -11,6 +11,7 @@ It's an on-prem solution that's designed to be a sort of building block: easy to
 
 - [Article motivating the system](https://peter.bourgon.org/ok-log)
 - [Detailed system design](DESIGN.md)
+- [Architectural Decision Records](doc/arch)
 
 ## Is OK Log for me?
 
@@ -113,13 +114,13 @@ To query structured logs, combine a basic grep filter expression with a tool lik
 
 ```sh
 $ oklog query -from 1h -q /api/v1/login
-2016-01-01 09:15:45 {"remote_addr":"10.34.115.3:50032","path":"/api/v1/login","method":"POST","status_code":200}
-2016-01-01 09:15:47 {"remote_addr":"10.9.101.113:51442","path":"/api/v1/login","method":"POST","status_code":500}
-2016-01-01 09:15:48 {"remote_addr":"10.9.55.2:55210","path":"/api/v1/login","method":"POST","status_code":200}
-2016-01-01 09:15:49 {"remote_addr":"10.34.115.1:51610","path":"/api/v1/login","method":"POST","status_code":200}
+{"remote_addr":"10.34.115.3:50032","path":"/api/v1/login","method":"POST","status_code":200}
+{"remote_addr":"10.9.101.113:51442","path":"/api/v1/login","method":"POST","status_code":500}
+{"remote_addr":"10.9.55.2:55210","path":"/api/v1/login","method":"POST","status_code":200}
+{"remote_addr":"10.34.115.1:51610","path":"/api/v1/login","method":"POST","status_code":200}
 ...
 
-$ oklog query -from 1h -q /api/v1/login | cut -d' ' -f3- | jq '. | select(.status_code == 500)'
+$ oklog query -from 1h -q /api/v1/login | jq '. | select(.status_code == 500)'
 {
 	"remote_addr": "10.9.55.2:55210",
 	"path": "/api/v1/login",
@@ -142,8 +143,14 @@ So, e.g. http://localhost:7650/ui.
 - [Docker](https://github.com/oklog/oklog/wiki/Integrations#docker)
 - [Kubernetes](https://github.com/oklog/oklog/wiki/Integrations#kubernetes)
 
+### Unofficial Docker images
+
+- [OK Log](https://hub.docker.com/r/oklog/oklog/)
+
 ### Translation
+
 - [中文介绍](https://github.com/1046102779/OKLog) 
+
 ---
 
 [OK icon](https://thenounproject.com/term/like/594444/) by
